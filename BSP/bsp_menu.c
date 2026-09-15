@@ -16,7 +16,8 @@
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
 #include "main.h"
-#include <stdio.h>
+#include "ftoa.h"
+#include "mystring.h"
 #include <string.h>
 
 /* ===== 模式枚举 ===== */
@@ -78,6 +79,16 @@ typedef enum {
 
 /* ===== 导航栈帧 ===== */
 #define NAV_STACK_DEPTH  5
+#define COEFF_DIGIT_COUNT 5
+#define PASSWORD_ERROR_DISPLAY_MS 2000U
+#define OPERATOR_COEFF_MIN 0.800f
+#define OPERATOR_COEFF_MAX 1.200f
+
+typedef enum {
+    ACCESS_NONE = 0,
+    ACCESS_OPERATOR,
+    ACCESS_DEVELOPER
+} access_level_t;
 
 typedef struct {
     menu_mode_t mode;
@@ -85,9 +96,11 @@ typedef struct {
     uint8_t     cursor;         /* LIST/ENUM: 选中项; PASSWORD: 编辑位 */
     uint8_t     scroll;         /* LIST: 滚动窗口起始 */
     float       edit_val;       /* NUMERIC: 临时编辑值 */
+    uint8_t     coeff_digits[COEFF_DIGIT_COUNT]; /* NUMERIC: Coeff 的 00.000 数位 */
     uint8_t     pwd_digits[3];  /* PASSWORD: 3位数字 */
     uint8_t     pwd_target;     /* PASSWORD: 成功后跳转的目标屏幕 */
-    uint8_t     pwd_err_timer;  /* PASSWORD: 错误倒计时 */
+    uint32_t    pwd_err_start_ms;     /* PASSWORD: 错误提示开始时刻 */
+    uint8_t     pwd_err_visible;      /* PASSWORD: 错误提示正在显示 */
     uint8_t     confirm_sel;    /* CONFIRM: 0=NO(安全默认), 1=YES */
     uint8_t     enum_val;       /* ENUM: 临时枚举值 */
 } nav_frame_t;
@@ -219,6 +232,7 @@ static nav_frame_t        s_nav_stack[NAV_STACK_DEPTH];
 static int8_t             s_nav_depth;           /* -1 = 不活跃 */
 static volatile uint16_t  s_idle_counter;        /* ISR 递增 */
 static menu_config_t      s_config;
+static access_level_t     s_access_level;
 
 /* ===== 栈操作 ===== */
 static void nav_push(menu_mode_t mode, screen_t scr)
@@ -379,7 +393,7 @@ static void save_enum_idx(screen_t scr, uint8_t idx)
     case SCR_FLOW_UNIT:   param_set_flow_unit(idx);   break;
     case SCR_TOTAL_UNIT:  param_set_total_unit(idx);  break;
     case SCR_PULSE_EQUIV: param_set_pulse_equiv(idx); break;
-    case SCR_BAUD_RATE:   param_set_baud_rate(idx); bsp_usart2_apply_baud_rate(idx); break;
+    case SCR_BAUD_RATE:   param_set_baud_rate(idx); bsp_usart2_apply_uart_config(param_get_uart_config()); break;
     case SCR_LANGUAGE:    param_set_language(idx);    break;
     default: break;
     }
@@ -395,11 +409,53 @@ static float load_readonly_val(screen_t scr)
     }
 }
 
+static uint8_t is_coeff_screen(screen_t scr)
+{
+    return (uint8_t)(scr == SCR_METER_COEFF || scr == SCR_MEDIUM_COEFF);
+}
+
+static void get_numeric_range(screen_t scr, float *p_min, float *p_max)
+{
+    const num_desc_t *desc = &c_num_desc[scr];
+
+    *p_min = desc->min_val;
+    *p_max = desc->max_val;
+    if (is_coeff_screen(scr) && s_access_level == ACCESS_OPERATOR) {
+        *p_min = OPERATOR_COEFF_MIN;
+        *p_max = OPERATOR_COEFF_MAX;
+    }
+}
+
+static void coeff_digits_from_value(nav_frame_t *f, float val)
+{
+    uint32_t scaled = (uint32_t)(val * 1000.0f + 0.5f);
+
+    f->coeff_digits[0] = (uint8_t)((scaled / 10000U) % 10U);
+    f->coeff_digits[1] = (uint8_t)((scaled / 1000U) % 10U);
+    f->coeff_digits[2] = (uint8_t)((scaled / 100U) % 10U);
+    f->coeff_digits[3] = (uint8_t)((scaled / 10U) % 10U);
+    f->coeff_digits[4] = (uint8_t)(scaled % 10U);
+}
+
+static float coeff_value_from_digits(const nav_frame_t *f)
+{
+    uint32_t scaled = (uint32_t)f->coeff_digits[0] * 10000U
+                    + (uint32_t)f->coeff_digits[1] * 1000U
+                    + (uint32_t)f->coeff_digits[2] * 100U
+                    + (uint32_t)f->coeff_digits[3] * 10U
+                    + (uint32_t)f->coeff_digits[4];
+
+    return (float)scaled / 1000.0f;
+}
+
 /* ===== 初始化编辑状态 ===== */
 static void init_mode_state(nav_frame_t *f)
 {
     if (f->mode == MODE_NUMERIC) {
         f->edit_val = load_param_val(f->screen_id);
+        if (is_coeff_screen(f->screen_id)) {
+            coeff_digits_from_value(f, f->edit_val);
+        }
     } else if (f->mode == MODE_ENUM) {
         f->enum_val = load_enum_idx(f->screen_id);
     }
@@ -480,15 +536,33 @@ static void render_list(nav_frame_t *f)
     uint8_t count;
     char buf[22];
     uint8_t i;
-    uint8_t visible_rows = 6;
+    const int is_main_menu = (f->screen_id == SCR_MAIN_MENU);
+    const int is_secondary_menu =
+        (f->screen_id == SCR_BASIC_LIST ||
+         f->screen_id == SCR_ACCUM_LIST ||
+         f->screen_id == SCR_CALIB_LIST ||
+         f->screen_id == SCR_SYSTEM_LIST);
+    const int is_level_3_or_4 = (s_nav_depth == 2 || s_nav_depth == 3);
+    const int use_7x10_layout = is_main_menu || is_secondary_menu || is_level_3_or_4;
+    uint8_t visible_rows = use_7x10_layout ? 5 : 6;
 
     get_list_data(f->screen_id, &items, &count);
     if (!items || count == 0) return;
 
-    /* 标题行 (反色) */
-    ssd1306_FillRectangle(0, 0, 127, 7, White);
-    ssd1306_SetCursor(2, 0);
-    ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_6x8, Black);
+    if (use_7x10_layout) {
+#ifdef SSD1306_INCLUDE_FONT_7x10
+        /* 1~4 级列表的新布局：7x10 黑底白字居中，标题不反色 */
+        const char *title = get_screen_title(f->screen_id);
+        uint8_t title_x = (uint8_t)((SSD1306_WIDTH - strlen(title) * 7U) / 2U);
+        ssd1306_SetCursor(title_x, 0);
+        ssd1306_WriteString((char *)title, Font_7x10, White);
+#endif
+    } else {
+        /* 更深层列表保持原有 6x8 反色标题 */
+        ssd1306_FillRectangle(0, 0, 127, 7, White);
+        ssd1306_SetCursor(2, 0);
+        ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_6x8, Black);
+    }
 
     /* 滚动窗口 */
     if (f->cursor >= visible_rows)
@@ -498,16 +572,36 @@ static void render_list(nav_frame_t *f)
 
     /* 列表项 */
     for (i = 0; i < visible_rows && (f->scroll + i) < count; i++) {
-        uint8_t y = (uint8_t)(8 + i * 9);  /* Font_6x8 行高 8px + 1px */
+        uint8_t y = use_7x10_layout
+                  ? (uint8_t)(10 + i * 11)  /* Font_7x10 行高 10px + 1px */
+                  : (uint8_t)(8 + i * 9);   /* Font_6x8 行高 8px + 1px */
         uint8_t idx = (uint8_t)(f->scroll + i);
         int is_sel = (idx == f->cursor);
 
         if (is_sel) {
-            ssd1306_FillRectangle(0, y, 127, (uint8_t)(y + 8), White);
+            ssd1306_FillRectangle(0, y, 127,
+                                  (uint8_t)(y + (use_7x10_layout ? 9 : 8)), White);
         }
-        snprintf(buf, sizeof(buf), " %-18s", items[idx].label);
+        {
+            const char *label = items[idx].label;
+            uint8_t field_chars = use_7x10_layout ? 18 : 19;
+            uint8_t max_label_chars = (uint8_t)(field_chars - 1);
+            buf[0] = ' ';
+            uint8_t llen = (uint8_t)strlen(label);
+            if (llen > max_label_chars) llen = max_label_chars;
+            (void)memcpy(buf + 1, label, llen);
+            uint8_t total = 1 + llen;
+            while (total < field_chars) buf[total++] = ' ';
+            buf[total] = '\0';
+        }
         ssd1306_SetCursor(2, y);
-        ssd1306_WriteString(buf, Font_6x8, is_sel ? Black : White);
+        if (use_7x10_layout) {
+#ifdef SSD1306_INCLUDE_FONT_7x10
+            ssd1306_WriteString(buf, Font_7x10, is_sel ? Black : White);
+#endif
+        } else {
+            ssd1306_WriteString(buf, Font_6x8, is_sel ? Black : White);
+        }
     }
 #else
     (void)f;
@@ -518,39 +612,76 @@ static void render_list(nav_frame_t *f)
 static void render_numeric(nav_frame_t *f)
 {
     const num_desc_t *desc = &c_num_desc[f->screen_id];
+    float min_val;
+    float max_val;
     char buf[32];
+    char tmp[16];
+    const char *title = get_screen_title(f->screen_id);
+    uint8_t x_start;
+
+    get_numeric_range(f->screen_id, &min_val, &max_val);
 
     ssd1306_Fill(Black);
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    /* 标题行 (反色) */
-    ssd1306_FillRectangle(0, 0, 127, 7, White);
-    ssd1306_SetCursor(2, 0);
-    ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_6x8, Black);
-#endif
+#ifdef SSD1306_INCLUDE_FONT_7x10
+    /* 标题：黑底白字居中，不使用选中效果 */
+    x_start = (uint8_t)((SSD1306_WIDTH - strlen(title) * 7U) / 2U);
+    ssd1306_SetCursor(x_start, 0);
+    ssd1306_WriteString((char *)title, Font_7x10, White);
 
-#ifdef SSD1306_INCLUDE_FONT_11x18
-    /* 数值居中 */
-    snprintf(buf, sizeof(buf), "%.*f", (int)desc->decimals, f->edit_val);
-    {
-        uint8_t x_start = (uint8_t)((128 - strlen(buf) * 11) / 2);
+    if (is_coeff_screen(f->screen_id)) {
+        static const uint8_t c_digit_x[COEFF_DIGIT_COUNT] = { 43, 50, 64, 71, 78 };
+        uint8_t i;
+
+        /* Coeff 固定为 00.000，当前编辑位反色显示 */
+        for (i = 0; i < COEFF_DIGIT_COUNT; i++) {
+            buf[0] = (char)('0' + f->coeff_digits[i]);
+            buf[1] = '\0';
+            if (i == f->cursor) {
+                ssd1306_FillRectangle(c_digit_x[i], 14,
+                                      (uint8_t)(c_digit_x[i] + 6), 23, White);
+                ssd1306_SetCursor(c_digit_x[i], 14);
+                ssd1306_WriteString(buf, Font_7x10, Black);
+            } else {
+                ssd1306_SetCursor(c_digit_x[i], 14);
+                ssd1306_WriteString(buf, Font_7x10, White);
+            }
+        }
+        ssd1306_SetCursor(57, 14);
+        ssd1306_WriteString(".", Font_7x10, White);
+    } else {
+        /* 普通数值页保持固定步长编辑 */
+        ftoa(f->edit_val, desc->decimals, buf, sizeof(buf));
+        x_start = (uint8_t)((SSD1306_WIDTH - strlen(buf) * 7U) / 2U);
         ssd1306_SetCursor(x_start, 14);
-        ssd1306_WriteString(buf, Font_11x18, White);
+        ssd1306_WriteString(buf, Font_7x10, White);
     }
-#endif
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    /* 范围提示 */
-    snprintf(buf, sizeof(buf), "Min:%.*f Max:%.*f",
-             (int)desc->decimals, desc->min_val,
-             (int)desc->decimals, desc->max_val);
-    ssd1306_SetCursor(0, 40);
-    ssd1306_WriteString(buf, Font_6x8, White);
+    /* Min/Max 拆成两行，避免 7x10 每行 18 字符的宽度限制 */
+    strcpy(buf, "Min:");
+    ftoa(min_val, desc->decimals, tmp, sizeof(tmp));
+    strcat(buf, tmp);
+    ssd1306_SetCursor(0, 28);
+    ssd1306_WriteString(buf, Font_7x10, White);
 
-    /* 步长 + 单位 */
-    snprintf(buf, sizeof(buf), "Step:%.*f %s", (int)desc->decimals, desc->step, desc->unit);
+    strcpy(buf, "Max:");
+    ftoa(max_val, desc->decimals, tmp, sizeof(tmp));
+    strcat(buf, tmp);
+    ssd1306_SetCursor(0, 39);
+    ssd1306_WriteString(buf, Font_7x10, White);
+
+    if (is_coeff_screen(f->screen_id)) {
+        strcpy(buf, "Enter:Next/Save");
+    } else {
+        /* 步长 + 单位 */
+        strcpy(buf, "Step:");
+        ftoa(desc->step, desc->decimals, tmp, sizeof(tmp));
+        strcat(buf, tmp);
+        strcat(buf, " ");
+        strcat(buf, desc->unit);
+    }
     ssd1306_SetCursor(0, 50);
-    ssd1306_WriteString(buf, Font_6x8, White);
+    ssd1306_WriteString(buf, Font_7x10, White);
 #endif
 }
 
@@ -560,6 +691,7 @@ static void render_enum(nav_frame_t *f)
     char buf[16];
     const char * const *opts = NULL;
     uint8_t opt_count = 0;
+    const uint8_t visible_rows = 5;
     int8_t start;
     uint8_t i;
 
@@ -577,29 +709,36 @@ static void render_enum(nav_frame_t *f)
 
     ssd1306_Fill(Black);
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    /* 标题行 (反色) */
-    ssd1306_FillRectangle(0, 0, 127, 7, White);
-    ssd1306_SetCursor(2, 0);
-    ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_6x8, Black);
-#endif
+#ifdef SSD1306_INCLUDE_FONT_7x10
+    /* 标题：黑底白字居中，不反色 */
+    {
+        const char *title = get_screen_title(f->screen_id);
+        uint8_t title_x = (uint8_t)((SSD1306_WIDTH - strlen(title) * 7U) / 2U);
+        ssd1306_SetCursor(title_x, 0);
+        ssd1306_WriteString((char *)title, Font_7x10, White);
+    }
 
-#ifdef SSD1306_INCLUDE_FONT_11x18
-    /* 选项列表 (每屏 3 个) */
-    start = (int8_t)f->enum_val - 1;
+    /* 选项列表：每屏 5 个，尽量使当前项居中 */
+    start = (int8_t)f->enum_val - 2;
     if (start < 0) start = 0;
-    if (start + 2 > (int8_t)(opt_count - 1)) start = (int8_t)(opt_count - 1) - 2;
+    if (start + (int8_t)visible_rows > (int8_t)opt_count)
+        start = (int8_t)opt_count - (int8_t)visible_rows;
     if (start < 0) start = 0;
 
-    for (i = 0; i < 3 && (start + (int8_t)i) < (int8_t)opt_count; i++) {
-        uint8_t y = (uint8_t)(14 + i * 18);
+    for (i = 0; i < visible_rows && (start + (int8_t)i) < (int8_t)opt_count; i++) {
+        uint8_t y = (uint8_t)(10 + i * 11);
         int is_sel = ((uint8_t)(start + i) == f->enum_val);
         if (is_sel) {
-            ssd1306_FillRectangle(0, y, 127, (uint8_t)(y + 17), White);
+            ssd1306_FillRectangle(0, y, 127, (uint8_t)(y + 9), White);
         }
-        snprintf(buf, sizeof(buf), " %s", opts[start + i]);
+        {
+            const char *opt = opts[start + i];
+            buf[0] = ' ';
+            buf[1] = '\0';
+            (void)strncat(buf, opt, sizeof(buf) - 2);
+        }
         ssd1306_SetCursor(2, y);
-        ssd1306_WriteString(buf, Font_11x18, is_sel ? Black : White);
+        ssd1306_WriteString(buf, Font_7x10, is_sel ? Black : White);
     }
 #endif
 }
@@ -612,11 +751,11 @@ static void render_password(nav_frame_t *f)
     ssd1306_Fill(Black);
 
     /* 错误倒计时中显示错误信息 */
-    if (f->pwd_err_timer > 0) {
+    if (f->pwd_err_visible) {
 #ifdef SSD1306_INCLUDE_FONT_11x18
-        ssd1306_SetCursor(10, 12);
+        ssd1306_SetCursor(20, 12);  /* (128 - 8 x 11) / 2 */
         ssd1306_WriteString("Password", Font_11x18, White);
-        ssd1306_SetCursor(4, 36);
+        ssd1306_SetCursor(31, 36);  /* (128 - 6 x 11) / 2 */
         ssd1306_WriteString("Error!", Font_11x18, White);
 #endif
         return;
@@ -648,63 +787,61 @@ static void render_password(nav_frame_t *f)
     }
 #endif
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    ssd1306_SetCursor(32, 48);
-    ssd1306_WriteString("Range:000~999", Font_6x8, White);
+#ifdef SSD1306_INCLUDE_FONT_7x10
+    /* 密码页的单独例外：13 char x 7px = 91px，居中显示 */
+    ssd1306_SetCursor(18, 48);
+    ssd1306_WriteString("Range:000~999", Font_7x10, White);
 #endif
 }
 
 /* ===== 渲染: M4 只读显示 ===== */
 static void render_readonly(nav_frame_t *f)
 {
-    char buf[16];
+    char buf[24];
     float val = load_readonly_val(f->screen_id);
+    const char *title = get_screen_title(f->screen_id);
 
     ssd1306_Fill(Black);
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    /* 标题行 (反色) */
-    ssd1306_FillRectangle(0, 0, 127, 7, White);
-    ssd1306_SetCursor(2, 0);
-    ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_6x8, Black);
-#endif
-
-#ifdef SSD1306_INCLUDE_FONT_11x18
-    /* 数值居中 */
-    snprintf(buf, sizeof(buf), "%.1f", val);
+#ifdef SSD1306_INCLUDE_FONT_7x10
+    /* 标题：黑底白字居中，不反色 */
     {
-        uint8_t x_start = (uint8_t)((128 - strlen(buf) * 11) / 2);
-        ssd1306_SetCursor(x_start, 14);
-        ssd1306_WriteString(buf, Font_11x18, White);
-    }
-#endif
-
-#ifdef SSD1306_INCLUDE_FONT_6x8
-    /* 动态单位 */
-    {
-        const char *unit_str = param_get_total_unit_str(param_get_total_unit());
-        ssd1306_SetCursor(100, 16);
-        ssd1306_WriteString((char *)unit_str, Font_6x8, White);
+        uint8_t title_x = (uint8_t)((SSD1306_WIDTH - strlen(title) * 7U) / 2U);
+        ssd1306_SetCursor(title_x, 0);
+        ssd1306_WriteString((char *)title, Font_7x10, White);
     }
 
     /* 设备信息特殊处理 */
     if (f->screen_id == SCR_DEVICE_INFO) {
-        snprintf(buf, sizeof(buf), "Addr:%d", param_get_modbus_addr());
-        ssd1306_SetCursor(0, 20);
-        ssd1306_WriteString(buf, Font_6x8, White);
+        strcpy(buf, "Addr:");
+        Int2String((int)param_get_modbus_addr(), buf + 5);
+        ssd1306_SetCursor(0, 18);
+        ssd1306_WriteString(buf, Font_7x10, White);
 
         {
             const char * const *baud_strs = param_get_baud_rate_strings();
-            snprintf(buf, sizeof(buf), "Baud:%s", baud_strs[param_get_baud_rate()]);
-            ssd1306_SetCursor(0, 30);
-            ssd1306_WriteString(buf, Font_6x8, White);
+            strcpy(buf, "Baud:");
+            (void)strncat(buf, baud_strs[param_get_baud_rate()], sizeof(buf) - 6);
+            ssd1306_SetCursor(0, 31);
+            ssd1306_WriteString(buf, Font_7x10, White);
         }
 
-        ssd1306_SetCursor(0, 40);
-        ssd1306_WriteString("FW:v1.0.0", Font_6x8, White);
+        ssd1306_SetCursor(0, 44);
+        ssd1306_WriteString("FW:v1.0.0", Font_7x10, White);
     } else {
-        ssd1306_SetCursor(32, 40);
-        ssd1306_WriteString("[Read Only]", Font_6x8, White);
+        const char *unit_str = param_get_total_unit_str(param_get_total_unit());
+        uint8_t x_start;
+
+        /* 累积值与单位组合后整体居中，避免单位覆盖数值 */
+        ftoa(val, 1, buf, sizeof(buf));
+        strcat(buf, " ");
+        strcat(buf, unit_str);
+        x_start = (uint8_t)((SSD1306_WIDTH - strlen(buf) * 7U) / 2U);
+        ssd1306_SetCursor(x_start, 18);
+        ssd1306_WriteString(buf, Font_7x10, White);
+
+        ssd1306_SetCursor(25, 42);
+        ssd1306_WriteString("[Read Only]", Font_7x10, White);
     }
 #endif
 }
@@ -714,41 +851,43 @@ static void render_confirm(nav_frame_t *f)
 {
     ssd1306_Fill(Black);
 
-#ifdef SSD1306_INCLUDE_FONT_11x18
-    /* 标题 */
-    ssd1306_SetCursor(8, 0);
-    ssd1306_WriteString((char *)get_screen_title(f->screen_id), Font_11x18, White);
-#endif
+#ifdef SSD1306_INCLUDE_FONT_7x10
+    /* 标题：黑底白字居中，不反色 */
+    {
+        const char *title = get_screen_title(f->screen_id);
+        uint8_t title_x = (uint8_t)((SSD1306_WIDTH - strlen(title) * 7U) / 2U);
+        ssd1306_SetCursor(title_x, 0);
+        ssd1306_WriteString((char *)title, Font_7x10, White);
+    }
 
-#ifdef SSD1306_INCLUDE_FONT_6x8
     /* 警告信息 */
     if (f->screen_id == SCR_CLEAR_TOTALS) {
-        ssd1306_SetCursor(8, 22);
-        ssd1306_WriteString("All totals will", Font_6x8, White);
-        ssd1306_SetCursor(8, 32);
-        ssd1306_WriteString("be reset to ZERO", Font_6x8, White);
+        ssd1306_SetCursor(8, 16);
+        ssd1306_WriteString("All totals will", Font_7x10, White);
+        ssd1306_SetCursor(8, 28);
+        ssd1306_WriteString("be reset to ZERO", Font_7x10, White);
     } else if (f->screen_id == SCR_FACTORY_RST) {
-        ssd1306_SetCursor(8, 22);
-        ssd1306_WriteString("All parameters", Font_6x8, White);
-        ssd1306_SetCursor(8, 32);
-        ssd1306_WriteString("will be DEFAULT", Font_6x8, White);
+        ssd1306_SetCursor(8, 16);
+        ssd1306_WriteString("All parameters", Font_7x10, White);
+        ssd1306_SetCursor(8, 28);
+        ssd1306_WriteString("will be DEFAULT", Font_7x10, White);
     }
 
     /* YES / NO 选项 */
     if (f->confirm_sel == 1) {
         /* YES 选中 */
-        ssd1306_FillRectangle(8, 48, 58, 56, White);
+        ssd1306_FillRectangle(8, 48, 58, 57, White);
         ssd1306_SetCursor(12, 48);
-        ssd1306_WriteString("YES", Font_6x8, Black);
+        ssd1306_WriteString("YES", Font_7x10, Black);
         ssd1306_SetCursor(72, 48);
-        ssd1306_WriteString("NO", Font_6x8, White);
+        ssd1306_WriteString("NO", Font_7x10, White);
     } else {
         /* NO 选中 (安全默认) */
         ssd1306_SetCursor(12, 48);
-        ssd1306_WriteString("YES", Font_6x8, White);
-        ssd1306_FillRectangle(68, 48, 100, 56, White);
+        ssd1306_WriteString("YES", Font_7x10, White);
+        ssd1306_FillRectangle(68, 48, 100, 57, White);
         ssd1306_SetCursor(72, 48);
-        ssd1306_WriteString("NO", Font_6x8, Black);
+        ssd1306_WriteString("NO", Font_7x10, Black);
     }
 #endif
 }
@@ -820,15 +959,52 @@ static void handle_numeric(key_event_t evt)
 {
     nav_frame_t *f = &s_nav_stack[s_nav_depth];
     const num_desc_t *desc = &c_num_desc[f->screen_id];
+    float min_val;
+    float max_val;
+
+    get_numeric_range(f->screen_id, &min_val, &max_val);
+
+    if (is_coeff_screen(f->screen_id)) {
+        switch (evt) {
+        case KEY_UP:
+            f->coeff_digits[f->cursor] =
+                (uint8_t)((f->coeff_digits[f->cursor] + 1U) % 10U);
+            break;
+        case KEY_DOWN:
+            f->coeff_digits[f->cursor] =
+                (uint8_t)((f->coeff_digits[f->cursor] + 9U) % 10U);
+            break;
+        case KEY_ENTER:
+            if (f->cursor < (COEFF_DIGIT_COUNT - 1U)) {
+                f->cursor++;
+            } else {
+                float val = coeff_value_from_digits(f);
+                if (val < min_val) val = min_val;
+                if (val > max_val) val = max_val;
+                save_param_val(f->screen_id, val);
+                nav_pop();
+                if (s_nav_depth < 0) { menu_exit(); return; }
+            }
+            break;
+        case KEY_BACK:
+            nav_pop();  /* 不保存 */
+            if (s_nav_depth < 0) { menu_exit(); return; }
+            break;
+        default:
+            return;
+        }
+        render_current_frame();
+        return;
+    }
 
     switch (evt) {
     case KEY_UP:
         f->edit_val += desc->step;
-        if (f->edit_val > desc->max_val) f->edit_val = desc->max_val;
+        if (f->edit_val > max_val) f->edit_val = max_val;
         break;
     case KEY_DOWN:
         f->edit_val -= desc->step;
-        if (f->edit_val < desc->min_val) f->edit_val = desc->min_val;
+        if (f->edit_val < min_val) f->edit_val = min_val;
         break;
     case KEY_ENTER:
         save_param_val(f->screen_id, f->edit_val);
@@ -890,7 +1066,7 @@ static void handle_password(key_event_t evt)
     nav_frame_t *f = &s_nav_stack[s_nav_depth];
 
     /* 错误倒计时中屏蔽按键 */
-    if (f->pwd_err_timer > 0) return;
+    if (f->pwd_err_visible) return;
 
     switch (evt) {
     case KEY_UP:
@@ -909,10 +1085,18 @@ static void handle_password(key_event_t evt)
             uint16_t pwd = (uint16_t)(f->pwd_digits[0] * 100 +
                           f->pwd_digits[1] * 10 +
                           f->pwd_digits[2]);
-            uint8_t ok = (uint8_t)(pwd == param_get_pwd_operator() ||
-                                   pwd == param_get_pwd_engineer());
+            access_level_t access_level = ACCESS_NONE;
+            uint8_t ok;
+
+            if (pwd == param_get_pwd_engineer()) {
+                access_level = ACCESS_DEVELOPER;
+            } else if (pwd == param_get_pwd_operator()) {
+                access_level = ACCESS_OPERATOR;
+            }
+            ok = (uint8_t)(access_level != ACCESS_NONE);
             if (ok) {
                 /* 成功: 弹出密码帧, 推入目标 */
+                s_access_level = access_level;
                 nav_pop();  /* 弹出密码帧 */
                 {
                     menu_mode_t m = detect_mode((screen_t)f->pwd_target);
@@ -920,7 +1104,8 @@ static void handle_password(key_event_t evt)
                     init_mode_state(&s_nav_stack[s_nav_depth]);
                 }
             } else {
-                f->pwd_err_timer = 7;  /* ~2.1 秒 */
+                f->pwd_err_start_ms = HAL_GetTick();
+                f->pwd_err_visible = 1;
                 f->cursor = 0;
                 memset(f->pwd_digits, 0, sizeof(f->pwd_digits));
             }
@@ -970,6 +1155,9 @@ static void handle_confirm(key_event_t evt)
                 param_set_reverse_total(0.0f);
             } else if (f->screen_id == SCR_FACTORY_RST) {
                 param_storage_reset_defaults();
+                /* 参数缓存/Flash 已恢复默认值，同步更新当前运行中的通信配置。 */
+                bsp_usart_set_modbus_addr(param_get_modbus_addr());
+                bsp_usart2_apply_uart_config(param_get_uart_config());
                 /* 同步复位 DAC/Span 到默认值 */
                 DacZeroValue = 12100;
                 DacFullValue = 60000;
@@ -1000,6 +1188,7 @@ static void handle_confirm(key_event_t evt)
 void menu_init(const menu_config_t *p_cfg)
 {
     s_nav_depth = -1;
+    s_access_level = ACCESS_NONE;
     s_config.idle_timeout_10ms = (p_cfg && p_cfg->idle_timeout_10ms) ? p_cfg->idle_timeout_10ms : 3000;
     s_idle_counter = 0;
 }
@@ -1032,15 +1221,19 @@ uint8_t menu_process(key_event_t key_evt, menu_status_t *p_out)
         return 0;
     }
 
-    /* 4. KEY_NONE: 驱动密码错误倒计时 */
-    if (key_evt == KEY_NONE) {
-        if (s_nav_depth >= 0) {
-            nav_frame_t *f = &s_nav_stack[s_nav_depth];
-            if (f->mode == MODE_PASSWORD && f->pwd_err_timer > 0) {
-                f->pwd_err_timer--;
-                if (f->pwd_err_timer == 0) render_current_frame();
-            }
+    /* 4. 密码错误提示到期后，在主循环恢复输入界面 */
+    {
+        nav_frame_t *f = &s_nav_stack[s_nav_depth];
+        if (f->mode == MODE_PASSWORD &&
+            f->pwd_err_visible &&
+            (uint32_t)(HAL_GetTick() - f->pwd_err_start_ms) >= PASSWORD_ERROR_DISPLAY_MS) {
+            f->pwd_err_visible = 0;
+            render_current_frame();
         }
+    }
+
+    /* 5. KEY_NONE: 无按键事件 */
+    if (key_evt == KEY_NONE) {
         if (p_out && s_nav_depth >= 0) {
             p_out->active = 1;
             p_out->screen_id = (uint8_t)s_nav_stack[s_nav_depth].screen_id;
@@ -1049,10 +1242,10 @@ uint8_t menu_process(key_event_t key_evt, menu_status_t *p_out)
         return 1;
     }
 
-    /* 5. 有按键: 重置空闲计时 */
+    /* 6. 有按键: 重置空闲计时 */
     s_idle_counter = 0;
 
-    /* 6. 按模式分发 */
+    /* 7. 按模式分发 */
     {
         nav_frame_t *f = &s_nav_stack[s_nav_depth];
         switch (f->mode) {
@@ -1080,6 +1273,7 @@ uint8_t menu_process(key_event_t key_evt, menu_status_t *p_out)
 void menu_exit(void)
 {
     s_nav_depth = -1;
+    s_access_level = ACCESS_NONE;
     ssd1306_Fill(Black);
     ssd1306_UpdateScreen();
 }
